@@ -1,13 +1,13 @@
 // Local adapter for the pinned FreeRDP browser build. It intentionally does not
 // modify the global WebSocket constructor, and never forwards relay controls to WASM.
-window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
+window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket, carrier) {
   const limit = 1024 * 1024;
   const frame = 16 * 1024;
-  const ws = new WebSocket(url, 'cloudssh-rdp-v1');
+  const ws = carrier ?? new WebSocket(url, 'cloudssh-rdp-v1');
   ws.binaryType = 'arraybuffer';
   const sink = {
     CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3, readyState: 0,
-    binaryType: 'arraybuffer', lease: undefined,
+    binaryType: 'arraybuffer', lease: undefined, certHold: false,
     send(value) {
       if (sink.readyState !== 1 || (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value))) return fail();
       if (value.byteLength > limit || pending + sent - acknowledged + value.byteLength > limit) return fail();
@@ -22,10 +22,10 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
     consumed(bytes) {
       if (sink.readyState !== 1 || !Number.isSafeInteger(bytes) || bytes < 0 || consumed + bytes > incoming) return fail();
       consumed += bytes;
-      if (!ackTimer) ackTimer = window.setTimeout(() => {
-        ackTimer = undefined;
-        if (sink.readyState === 1) ws.send(JSON.stringify({ type: 'ack', bytes: consumed }));
-      }, 16);
+      if (consumed === ackSent) return;
+      // Release direct-carrier read credit sooner without ACKing every packet or unconsumed bytes.
+      if (carrier && consumed - ackSent >= 4 * frame) acknowledgeReads();
+      else if (ackTimer === undefined) ackTimer = window.setTimeout(acknowledgeReads, carrier ? 8 : 16);
     },
     probe() {
       if (sink.readyState !== 1) return;
@@ -36,6 +36,13 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
       try { ws.send(JSON.stringify({ type: 'ping', id: sequence })); } catch { fail(); }
     },
     cancelProbe() { probe = undefined; },
+    takeReceiveBacklog() {
+      // Bytes delivered to the browser adapter but not yet consumed by WASM, not a rendering metric.
+      if (sink.readyState !== 1) return;
+      const value = receivePeak;
+      receivePeak = incoming - consumed;
+      return value;
+    },
     reportDesktopReady() {
       if (sink.readyState !== 1 || !canReport || reported) return;
       reported = true;
@@ -47,6 +54,16 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
       lastActivity = now;
       ws.send('{"type":"activity"}');
     },
+    beginCertWait() {
+      if (sink.readyState !== 1 || certWaitSent) return;
+      certWaitSent = true;
+      try { ws.send('{"type":"cert_wait"}'); } catch { fail(); }
+    },
+    endCertWait() {
+      if (sink.readyState !== 1 || !certWaitSent) return;
+      certWaitSent = false;
+      try { ws.send('{"type":"cert_done"}'); } catch { fail(); }
+    },
     close() {
       if (sink.readyState < 2) {
         probe = undefined;
@@ -55,16 +72,25 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
       }
     },
   };
-  let canReport = false, reported = false;
+  let canReport = false, reported = false, certWaitSent = false;
   let sequence = 0, probe;
   let sent = 0;
   let acknowledged = 0;
   let pending = 0;
   let incoming = 0;
   let consumed = 0;
+  let ackSent = 0;
+  let receivePeak = 0;
   let lastActivity = -Infinity;
   let ackTimer;
   const queue = [];
+  function acknowledgeReads() {
+    clearTimeout(ackTimer);
+    ackTimer = undefined;
+    if (sink.readyState !== 1 || consumed === ackSent) return;
+    ackSent = consumed;
+    try { ws.send(JSON.stringify({ type: 'ack', bytes: ackSent })); } catch { fail(); }
+  }
   function fail() {
     if (sink.readyState >= 2) return;
     sink.close();
@@ -95,6 +121,8 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
           sink.lease = value.lease;
           sink.readyState = 1;
           sink.onopen?.(new Event('open'));
+        } else if (value?.type === 'cert_hold' && sink.readyState === 1) {
+          sink.certHold = true;
         } else if (value?.type === 'desktop_recorded' && sink.readyState === 1 && reported) {
           sink.onDesktopRecorded?.();
         } else if (value?.type === 'pong' && sink.readyState === 1) {
@@ -111,6 +139,7 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
       }
       if (sink.readyState !== 1 || !(data instanceof ArrayBuffer) || data.byteLength === 0 || data.byteLength > frame || incoming - consumed + data.byteLength > limit) return fail();
       incoming += data.byteLength;
+      receivePeak = Math.max(receivePeak, incoming - consumed);
       sink.onmessage?.({ data });
     } catch { fail(); }
   };
@@ -123,5 +152,6 @@ window.createCloudSshRdpSocket = function createCloudSshRdpSocket(url, ticket) {
     sink.onRelayClose?.(event.reason);
     sink.onclose?.(event);
   };
+  ws.activate?.(); // Prepared direct carriers replay only Ready, not the consumed ticket.
   return sink;
 };

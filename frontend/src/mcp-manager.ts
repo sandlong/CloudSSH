@@ -2,13 +2,12 @@ import './mcp-manager.css';
 import { onServerRemoved } from './server-removal';
 import { getLocale, localizedElement as element, onLocaleChange, t, type TranslationKey } from './i18n';
 import { copyTextToClipboard } from './clipboard';
-import type {
-  McpActivity,
-  McpConfigInfo,
-  McpSavedCredentials,
-} from '../../src/mcp-schema';
+import type { McpActivity, McpConfigInfo, McpSavedCredentials } from '../../src/mcp-schema';
 import type { AppConfig } from './app-bootstrap';
 import { createAssistantIcon } from './assistant-icons';
+import { createModalHeader } from './modal-ui';
+import { confirmAction } from './ui-feedback';
+import { createMcpActivityView } from './mcp-activity-view';
 import { buildMcpClientConfig, normalizeMcpAccessCredentials } from './mcp-client-config';
 import { createMcpPermissionEditor, type McpServerOption } from './mcp-permission-editor';
 import './assistant-ui.css';
@@ -31,7 +30,7 @@ function disclosure(key: TranslationKey): HTMLDetailsElement {
   return node;
 }
 
-/** One account configuration. Plaintext is fetched only for an explicit copy/view action. */
+/** One account configuration. Plaintext is fetched only for an explicit copy. */
 export class McpManager {
   private identity: string | null = null;
   private authMode: AppConfig['authMode'];
@@ -108,27 +107,14 @@ export class McpManager {
     });
     const dialog = element('dialog');
     dialog.id = 'mcp-dialog';
-    dialog.className = 'mcp-dialog';
+    dialog.className = 'app-modal mcp-dialog';
     dialog.setAttribute('aria-labelledby', 'mcp-title');
-    const header = element('header');
-    header.className = 'assistant-panel-header';
-    const title = element('h2', 'mcp.title');
-    title.id = 'mcp-title';
-    title.className = 'assistant-panel-title';
+    const { header, title } = createModalHeader('mcp-title', 'mcp.title', () => this.close());
+    header.classList.add('app-modal__header--bar', 'assistant-panel-header');
+    title.classList.add('assistant-panel-title');
     const icon = createAssistantIcon('mcp');
     icon.classList.add('assistant-panel-icon');
-    const close = button('common.close', () => this.close());
-    close.className = 'assistant-icon-action';
-    close.removeAttribute('data-i18n');
-    close.setAttribute('aria-label', t('common.close'));
-    close.title = t('common.close');
-    close.dataset.i18nAriaLabel = close.dataset.i18nTitle = 'common.close';
-    const closeIcon = element('span');
-    closeIcon.className = 'material-symbols-outlined';
-    closeIcon.setAttribute('aria-hidden', 'true');
-    closeIcon.textContent = 'close';
-    close.replaceChildren(closeIcon);
-    header.append(icon, title, close);
+    header.prepend(icon);
     const body = element('div');
     body.className = 'mcp-body';
     this.status = element('p');
@@ -136,7 +122,7 @@ export class McpManager {
     this.status.textContent = t('mcp.loading');
     body.append(this.status);
     const panel = element('div');
-    panel.className = 'mcp-dialog__panel assistant-shell assistant-panel-surface';
+    panel.className = 'app-modal__panel mcp-dialog__panel assistant-shell assistant-panel-surface';
     panel.append(header, body);
     dialog.append(panel);
     this.dialog = dialog;
@@ -192,16 +178,12 @@ export class McpManager {
       this.authMode === 'cf_access'
         ? this.buildAccessGuide(form, !info.hasAccessCredentials)
         : null;
-    const configArea = element('div');
-    configArea.id = 'mcp-config-preview';
     const footer = element('footer');
     footer.className = 'mcp-actions assistant-panel-footer';
-    const copy = button('mcp.copyConfig', () => void exportConfig(false));
+    const copy = button('mcp.copyConfig', () => void copyConfig());
     copy.id = 'mcp-copy-config';
-    copy.className = 'assistant-action';
-    const view = button('mcp.viewConfig', () => void exportConfig(true));
-    view.id = 'mcp-view-config';
-    view.className = 'assistant-action';
+    const rotate = button('mcp.rotateKey', () => void rotateKey());
+    rotate.id = 'mcp-rotate-key';
     const save = element('button');
     save.type = 'submit';
     save.id = 'mcp-save-config';
@@ -218,9 +200,9 @@ export class McpManager {
           access.clientSecret.value.trim())
       );
     const syncButtons = () => {
-      const exportDisabled = busy || !info.configured;
-      if (copy.disabled !== exportDisabled) copy.disabled = exportDisabled;
-      if (view.disabled !== exportDisabled) view.disabled = exportDisabled;
+      copy.disabled = busy || !info.configured;
+      rotate.hidden = !info.configured;
+      rotate.disabled = busy || !info.id;
       const changed = dirty();
       const saveDisabled = busy || !changed;
       if (save.disabled !== saveDisabled) save.disabled = saveDisabled;
@@ -235,9 +217,9 @@ export class McpManager {
     form.addEventListener('change', syncButtons);
     signal.addEventListener('abort', onLocaleChange(syncButtons), { once: true });
     syncButtons();
-    footer.append(view, copy, save);
-    const exportConfig = async (preview: boolean) => {
-      if (busy) return;
+    footer.append(rotate, copy, save);
+    const copyConfig = async () => {
+      if (copy.disabled) return;
       busy = true;
       syncButtons();
       try {
@@ -252,34 +234,61 @@ export class McpManager {
           );
         });
         void textPromise.catch(() => {});
-        if (preview) {
-          const text = await textPromise;
-          const label = element('label');
-          label.append(element('span', 'mcp.clientConfig'));
-          const output = element('textarea');
-          output.readOnly = true;
-          output.className = 'terminal-input assistant-field';
-          output.id = 'mcp-client-config';
-          output.rows = 9;
-          output.value = text;
-          label.append(output);
-          configArea.replaceChildren(label);
-        } else {
-          // Start the clipboard write during the click, before awaiting the network (Safari).
-          if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
-            await navigator.clipboard.write([
-              new ClipboardItem({
-                'text/plain': textPromise.then((text) => new Blob([text], { type: 'text/plain' })),
+        // Start the clipboard write during the click, before awaiting the network (Safari).
+        if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+          await navigator.clipboard.write([
+            new ClipboardItem({
+              'text/plain': textPromise.then((text) => {
+                signal.throwIfAborted();
+                return new Blob([text], { type: 'text/plain' });
               }),
-            ]);
-          } else if (!(await copyTextToClipboard(await textPromise)))
-            throw new Error('copy_failed');
-          if (generation === this.generation) this.message('mcp.copied');
+            }),
+          ]);
+        } else if (!(await copyTextToClipboard(await textPromise))) {
+          throw new Error('copy_failed');
         }
+        if (generation === this.generation) this.message('mcp.copied');
       } catch {
         if (generation === this.generation) this.message('mcp.error');
       } finally {
         if (generation === this.generation) {
+          busy = false;
+          syncButtons();
+        }
+      }
+    };
+    const rotateKey = async () => {
+      const expectedId = info.id;
+      if (rotate.disabled || !expectedId) return;
+      const confirmed = await confirmAction({
+        title: t('mcp.rotateKey'), message: t('mcp.rotateConfirm'),
+        confirmText: t('mcp.rotateKey'), variant: 'danger',
+      });
+      if (!confirmed || signal.aborted || busy || info.id !== expectedId) return;
+      busy = true;
+      syncButtons();
+      try {
+        const result = await this.api<{ id: string }>('/api/mcp/config/rotate', {
+          method: 'POST', body: JSON.stringify({ expectedId }),
+        });
+        if (signal.aborted) return;
+        if (typeof result.id !== 'string' || !result.id || result.id === expectedId)
+          throw new Error('invalid_rotation_result');
+        info = { ...info, id: result.id };
+        this.message('mcp.keyRotated');
+      } catch {
+        if (signal.aborted) return;
+        // A timed-out request might have committed. Read metadata once; never resubmit a rotation.
+        let changed = false;
+        try {
+          const latest = await this.api<McpConfigInfo>('/api/mcp/config');
+          if (signal.aborted) return;
+          info = { ...info, id: latest.id };
+          changed = !!latest.id && latest.id !== expectedId;
+        } catch { /* The result may still be unknown. */ }
+        if (!signal.aborted) this.message(changed ? 'mcp.keyChanged' : 'mcp.rotationUnconfirmed');
+      } finally {
+        if (!signal.aborted) {
           busy = false;
           syncButtons();
         }
@@ -319,7 +328,6 @@ export class McpManager {
           if (generation !== this.generation) return;
           info = result;
           permissions.reset(info.grants);
-          configArea.replaceChildren();
           if (access) {
             access.clientId.value = access.clientSecret.value = '';
             access.confirmed.checked = false;
@@ -343,7 +351,7 @@ export class McpManager {
         }
       })();
     });
-    parent.append(form, configArea);
+    parent.append(form);
     parent.parentElement?.append(footer);
     return (id: number) => {
       permissions.removeServer(id);
@@ -474,17 +482,10 @@ export class McpManager {
     return section;
   }
   private buildActivity(parent: HTMLElement, servers: { id: number; name: string }[]) {
-    const names = new Map(servers.map((server) => [server.id, server.name]));
-    const section = disclosure('mcp.activity');
-    section.id = 'mcp-activity-section';
-    const list = element('div');
-    list.id = 'mcp-activity-list';
-    list.setAttribute('role', 'list');
-    list.setAttribute('aria-label', t('mcp.activity'));
-    list.dataset.i18nAriaLabel = 'mcp.activity';
-    list.tabIndex = 0;
-    section.append(list);
+    const view = createMcpActivityView(servers);
+    const { section } = view;
     parent.append(section);
+    this.controller!.signal.addEventListener('abort', onLocaleChange(() => view.render()), { once: true });
     const generation = this.generation;
     let refreshId = 0;
     const refresh = async (id: number) => {
@@ -493,41 +494,9 @@ export class McpManager {
         try {
           const items = await this.api<McpActivity[]>('/api/mcp/activity');
           if (id !== refreshId || generation !== this.generation || !section.open) return;
-          list.replaceChildren();
-          const live = items.slice(0, 100).filter((item) => names.has(item.serverId));
-          if (!live.length) list.append(element('p', 'mcp.noActivity'));
-          const dateTime = new Intl.DateTimeFormat(getLocale(), {
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-          });
-          const time = new Intl.DateTimeFormat(getLocale(), {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-          });
-          for (const item of live) {
-            const record = element('div');
-            record.dataset.serverId = String(item.serverId);
-            record.className = 'mcp-operation';
-            record.setAttribute('role', 'listitem');
-            const start = new Date(item.startedAt);
-            const end = item.finishedAt === null ? null : new Date(item.finishedAt);
-            const period =
-              dateTime.format(start) +
-              (end
-                ? ` — ${end.toDateString() === start.toDateString() ? time.format(end) : dateTime.format(end)}`
-                : '');
-            record.textContent = `${period}  ${names.get(item.serverId)} · ${t(`mcp.status.${item.status}`)}  ${item.tool}`;
-            list.append(record);
-          }
+          view.setItems(items);
         } catch {
-          if (generation === this.generation) this.message('mcp.error');
+          if (id === refreshId && generation === this.generation && section.open) view.setError();
         }
       }
       if (id === refreshId && generation === this.generation && section.open)
@@ -537,12 +506,11 @@ export class McpManager {
       if (this.timer !== undefined) clearTimeout(this.timer);
       this.timer = undefined;
       refreshId++;
-      if (section.open) void refresh(refreshId);
+      if (section.open) {
+        view.render();
+        void refresh(refreshId);
+      }
     });
-    return (id: number) => {
-      if (!names.delete(id)) return;
-      list.querySelectorAll(`[data-server-id="${id}"]`).forEach((row) => row.remove());
-      if (section.open && !list.childElementCount) list.append(element('p', 'mcp.noActivity'));
-    };
+    return view.removeServer;
   }
 }

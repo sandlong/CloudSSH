@@ -1,3 +1,5 @@
+import { SSH_EXEC_ERROR_CODES } from './ssh/exec-error';
+
 /** Personal automation, not a terminal takeover or an audit protocol. */
 export const MCP_SCOPES = ['read', 'write', 'exec', 'context'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
@@ -16,6 +18,7 @@ export interface McpAccessCredentials {
 }
 export interface McpConfigInfo {
   configured: boolean;
+  /** Opaque credential generation. Changes only when the personal key is rotated. */
   id: string | null;
   grants: McpGrant[];
   hasAccessCredentials: boolean;
@@ -37,12 +40,27 @@ export interface McpPrincipal {
   expiresAt: number;
   createdAt: number;
 }
+export const MCP_FAILURE_REASONS = [
+  ...SSH_EXEC_ERROR_CODES,
+  'host_verification_required',
+  'interactive_auth_required',
+  'connection_failed',
+  'operation_timeout',
+  'operation_cancelled',
+  'operation_failed',
+] as const;
+export type McpFailureReason = (typeof MCP_FAILURE_REASONS)[number];
+export function isMcpFailureReason(value: unknown): value is McpFailureReason {
+  return MCP_FAILURE_REASONS.includes(value as McpFailureReason);
+}
+
 export interface McpActivity {
   id: string;
   client: string;
   serverId: number;
   tool: string;
-  status: 'running' | 'success' | 'error' | 'unknown';
+  status: 'running' | 'success' | 'failed' | 'error' | 'unknown';
+  failureReason?: McpFailureReason;
   startedAt: number;
   finishedAt: number | null;
 }
@@ -89,8 +107,8 @@ export async function mcpHash(value: string): Promise<string> {
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
 }
-export async function readMcpJson(request: Request): Promise<unknown> {
-  if (Number(request.headers.get('Content-Length')) > MCP_MAX_BODY_BYTES)
+export async function readMcpJson(request: Request, maxBytes = MCP_MAX_BODY_BYTES): Promise<unknown> {
+  if (Number(request.headers.get('Content-Length')) > maxBytes)
     throw new Error('body_too_large');
   const reader = request.body?.getReader();
   if (!reader) throw new Error('invalid_arguments');
@@ -106,7 +124,7 @@ export async function readMcpJson(request: Request): Promise<unknown> {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MCP_MAX_BODY_BYTES) throw new Error('body_too_large');
+      if (size > maxBytes) throw new Error('body_too_large');
       chunks.push(value);
     }
     if (timedOut) throw new Error('body_timeout');

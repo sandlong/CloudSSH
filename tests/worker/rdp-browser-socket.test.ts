@@ -9,31 +9,35 @@ interface SocketAdapter {
   consumed(bytes: number): void;
   readyState: number;
   lease?: string;
+  certHold: boolean;
+  beginCertWait(): void;
+  endCertWait(): void;
   reportDesktopReady(): void;
   onRelayClose?: (reason: string) => void;
   onclose?: (event: { reason: string }) => void;
   onDesktopRecorded?: () => void;
   probe(): void;
   cancelProbe(): void;
+  takeReceiveBacklog(): number | undefined;
   onRelayRtt?: (ms: number) => void;
   onopen?: () => void;
   onmessage?: (event: { data: unknown }) => void;
 }
 const lease = '12345678-1234-1234-1234-123456789abc';
 const ready = JSON.stringify({ type: 'ready', lease });
-function fixture(clock = performance) {
+function fixture(clock = performance, direct = false) {
   const native = {
     protocol: 'cloudssh-rdp-v1',
     send: vi.fn(), close: vi.fn(),
     onclose: (_event: { reason: string }) => {},
     onopen: () => {}, onmessage: (_event: { data: unknown }) => {},
   };
-  const browser = { setTimeout, createCloudSshRdpSocket: (_url: string, _token: string) => ({}) as SocketAdapter };
+  const browser = { setTimeout, createCloudSshRdpSocket: (_url: string, _token: string, _carrier?: typeof native) => ({}) as SocketAdapter };
   class FakeWebSocket {
     constructor() { return native; }
   }
   runInNewContext(code, { window: browser, WebSocket: FakeWebSocket, Event, ArrayBuffer, Uint8Array, performance: clock, clearTimeout });
-  const socket = browser.createCloudSshRdpSocket('wss://example.com/api/rdp/session', 'token');
+  const socket = browser.createCloudSshRdpSocket('wss://example.com/api/rdp/session', 'token', direct ? native : undefined);
   return { native, socket };
 }
 
@@ -66,8 +70,56 @@ describe('FreeRDP browser socket', () => {
       await vi.advanceTimersByTimeAsync(20);
       expect(native.send).toHaveBeenCalledOnce();
       socket.consumed(12);
-      await vi.advanceTimersByTimeAsync(20);
+      await vi.advanceTimersByTimeAsync(15);
+      expect(native.send).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
       expect(native.send).toHaveBeenLastCalledWith('{"type":"ack","bytes":12}');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('releases direct read credit after 8 ms or 64 KiB without duplicate or delivery-only ACKs', async () => {
+    vi.useFakeTimers();
+    try {
+      const { native, socket } = fixture(performance, true);
+      native.onmessage({ data: ready });
+      for (let i = 0; i < 5; i++) native.onmessage({ data: new ArrayBuffer(16 * 1024) });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(native.send).not.toHaveBeenCalled();
+      socket.consumed(1200);
+      await vi.advanceTimersByTimeAsync(7);
+      expect(native.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(native.send).toHaveBeenCalledExactlyOnceWith('{"type":"ack","bytes":1200}');
+      socket.consumed(8 * 1024);
+      expect(native.send).toHaveBeenCalledTimes(1);
+      socket.consumed(56 * 1024);
+      expect(native.send).toHaveBeenLastCalledWith('{"type":"ack","bytes":66736}');
+      socket.consumed(0);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(native.send).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('samples the receive high-water mark without changing read credit', async () => {
+    vi.useFakeTimers();
+    try {
+      const { native, socket } = fixture();
+      expect(socket.takeReceiveBacklog()).toBeUndefined();
+      native.onmessage({ data: ready });
+      expect(socket.takeReceiveBacklog()).toBe(0);
+      native.onmessage({ data: new ArrayBuffer(16 * 1024) });
+      native.onmessage({ data: new ArrayBuffer(16 * 1024) });
+      socket.consumed(24 * 1024);
+      expect(socket.takeReceiveBacklog()).toBe(32 * 1024);
+      expect(socket.takeReceiveBacklog()).toBe(8 * 1024); // Still queued at the next interval's start.
+      socket.consumed(8 * 1024);
+      expect(socket.takeReceiveBacklog()).toBe(8 * 1024);
+      expect(socket.takeReceiveBacklog()).toBe(0);
+      expect(native.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(native.send).toHaveBeenCalledExactlyOnceWith('{"type":"ack","bytes":32768}');
+      native.onclose({ reason: 'closed' });
+      expect(socket.takeReceiveBacklog()).toBeUndefined();
     } finally { vi.useRealTimers(); }
   });
 
@@ -110,5 +162,19 @@ describe('FreeRDP browser socket', () => {
     expect(native.send.mock.calls.every(([frame]) => frame.byteLength === 16 * 1024)).toBe(true);
     socket.send(new ArrayBuffer(1));
     expect(native.close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps certificate hold and completion outside the WASM stream', () => {
+    const { native, socket } = fixture();
+    const onData = socket.onmessage = vi.fn();
+    native.onmessage({ data: ready });
+    socket.beginCertWait();
+    socket.beginCertWait();
+    expect(native.send).toHaveBeenCalledExactlyOnceWith('{"type":"cert_wait"}');
+    native.onmessage({ data: '{"type":"cert_hold"}' });
+    expect(socket.certHold).toBe(true);
+    expect(onData).not.toHaveBeenCalled();
+    socket.endCertWait();
+    expect(native.send).toHaveBeenLastCalledWith('{"type":"cert_done"}');
   });
 });

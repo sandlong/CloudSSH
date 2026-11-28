@@ -1,11 +1,14 @@
 import { expect, test, type Page } from './fixtures';
 import AxeBuilder from '@axe-core/playwright';
-import { revealMcpGrant } from './helpers';
+import { mcpCopies, mockMcpClipboard, revealMcpGrant } from './helpers';
+import type { McpActivity } from '../../src/mcp-schema';
 
 const servers = [1, 3].map(id => ({ id, user_id: 1, name: `Personal server ${id}`, host: 'ssh.example.com', port: 22,
   username: 'deploy', auth_method: 'password', tags: [] as string[], os: null, region: null, created_at: '', updated_at: '' }));
-const id = '12345678-1234-1234-1234-123456789abc';
+const id = '12345678-1234-4234-8234-123456789abc';
+const newId = '22345678-1234-4234-8234-123456789abc';
 const token = 'SINGLETON-PERSONAL-TOKEN';
+const newToken = 'ROTATED-PERSONAL-TOKEN';
 const session = `session:1780000000000:${id}`;
 const empty = () => ({ configured: false, id: null as string | null, grants: [] as { serverId: number; scopes: string[] }[], hasAccessCredentials: false, legacy: false });
 
@@ -16,31 +19,39 @@ async function setup(page: Page, inventory = servers) {
   await page.route('**/api/auth/me', route => route.request().method() === 'GET'
     ? route.fulfill({ json: { id: 1, github_id: 42, username: 'tester', avatar_url: null } }) : route.fallback());
   await page.route('**/api/servers', route => route.request().method() === 'GET' ? route.fulfill({ json: inventory }) : route.fallback());
-  const state = { info: empty(), created: 0, writes: [] as any[], exports: 0, activityReads: 0 };
+  const state = { info: empty(), created: 0, writes: [] as any[], exports: 0, activityReads: 0,
+    rotations: [] as unknown[], configReads: 0, token };
   await page.route('**/api/mcp/config', route => {
     const method = route.request().method();
-    if (method === 'GET') return route.fulfill({ json: state.info });
+    if (method === 'GET') {
+      state.configReads++;
+      return route.fulfill({ json: state.info });
+    }
     if (!['POST', 'PUT'].includes(method)) return route.fallback();
     const body = route.request().postDataJSON(); state.writes.push(body);
     if (method === 'POST' && !state.info.configured) state.created++;
-    state.info = { ...state.info, configured: true, id, grants: body.grants, legacy: false };
+    state.info = { ...state.info, configured: true, id: state.info.id ?? id, grants: body.grants, legacy: false };
     return route.fulfill({ json: state.info });
+  });
+  await page.route('**/api/mcp/config/rotate', async route => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    const body = route.request().postDataJSON();
+    state.rotations.push(body);
+    expect((await route.request().allHeaders()).origin).toBe(new URL(route.request().url()).origin);
+    if (body.expectedId !== state.info.id) return route.fulfill({ status: 409, json: { error: 'mcp_config_changed' } });
+    state.info.id = newId;
+    state.token = newToken;
+    return route.fulfill({ json: { id: newId } });
   });
   await page.route('**/api/mcp/config/credentials', route => {
     if (route.request().method() !== 'POST') return route.fallback();
-    state.exports++; return route.fulfill({ json: { token } });
+    state.exports++; return route.fulfill({ json: { token: state.token } });
   });
   await page.route('**/api/mcp/activity', route => {
     if (route.request().method() !== 'GET') return route.fallback();
     state.activityReads++; return route.fulfill({ json: [{ id: 'op', client: 'MCP', serverId: 1, tool: 'sftp_read', status: 'success', startedAt: Date.now(), finishedAt: Date.now() }] });
   });
-  await page.addInitScript(() => {
-    (window as any).__mcpCopies = [];
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
-      write: async (items: ClipboardItem[]) => { for (const item of items) (window as any).__mcpCopies.push(await (await item.getType('text/plain')).text()); },
-      writeText: async (text: string) => { (window as any).__mcpCopies.push(text); },
-    } });
-  });
+  await mockMcpClipboard(page);
   return state;
 }
 async function openPanel(page: Page) {
@@ -99,6 +110,8 @@ test('one permanent configuration: generate once, repeatedly copy, change separa
   await expect(dialog.locator('[data-i18n="mcp.compactIntro"], [data-i18n="mcp.legacyHint"], [data-i18n="mcp.help"], [data-i18n="mcp.shortSafety"]')).toHaveCount(0);
   await expect(page.locator('input[name="name"], input[name="days"], #mcp-token-list, #mcp-access-guide')).toHaveCount(0);
   await expect(dialog).not.toContainText('Revoke');
+  await expect(dialog.getByRole('button', { name: 'View configuration' })).toHaveCount(0);
+  await expect(page.locator('#mcp-rotate-key')).toBeHidden();
   await expect(page.locator('#mcp-copy-config')).toBeDisabled();
   await revealMcpGrant(page, 1);
   await page.locator('input[data-server-id="1"][value="read"]').check();
@@ -110,11 +123,11 @@ test('one permanent configuration: generate once, repeatedly copy, change separa
   await expect(page.locator('#mcp-copy-config')).toBeEnabled(); expect(state.exports).toBe(0);
   await expect(page.locator('#mcp-save-config')).toBeDisabled();
   await page.locator('#mcp-copy-config').click();
-  await expect.poll(() => page.evaluate(() => (window as any).__mcpCopies.length)).toBe(1);
+  await expect.poll(async () => (await mcpCopies(page)).length).toBe(1);
   await page.locator('#mcp-copy-config').click();
-  await expect.poll(() => page.evaluate(() => (window as any).__mcpCopies.length)).toBe(2);
+  await expect.poll(async () => (await mcpCopies(page)).length).toBe(2);
   await expect(page.locator('#mcp-save-config')).toBeDisabled();
-  const copies = await page.evaluate(() => (window as any).__mcpCopies);
+  const copies = await mcpCopies(page);
   expect(copies[0]).toBe(copies[1]); expect(JSON.parse(copies[0]).mcpServers.cloudssh.headers.Authorization).toBe(`Bearer ${token}`);
   await page.locator('input[data-server-id="1"][value="context"]').check();
   await page.locator('input[data-server-id="3"][value="exec"]').uncheck();
@@ -123,12 +136,13 @@ test('one permanent configuration: generate once, repeatedly copy, change separa
   await expect.poll(() => state.writes.length).toBe(2);
   expect(state.writes[1]).toEqual({ grants: [{ serverId: 1, scopes: ['read', 'context'] }, { serverId: 3, scopes: ['write'] }] });
   expect(state.created).toBe(1);
-  await page.locator('#mcp-view-config').click();
-  await expect(page.locator('#mcp-client-config')).toHaveValue(new RegExp(token));
+  await page.locator('#mcp-copy-config').click();
+  await expect.poll(async () => (await mcpCopies(page)).length).toBe(3);
+  await expect(dialog.locator('textarea')).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include('#mcp-dialog').analyze()).violations).toEqual([]);
   await dialog.getByRole('button', { name: 'Close', exact: true }).click();
   await openPanel(page);
-  await expect(page.locator('#mcp-client-config')).toHaveCount(0);
+  expect(state.exports).toBe(3);
   await revealMcpGrant(page, 1);
   await expect(page.locator('input[data-server-id="1"][value="context"]')).toBeChecked();
   await page.locator('#mcp-copy-config').click();
@@ -136,6 +150,63 @@ test('one permanent configuration: generate once, repeatedly copy, change separa
   expect(state.created).toBe(1);
   expect(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage]))).not.toContain(token);
 });
+
+test('rotate requires confirmation and keeps the permission draft; only explicit copy exports the new key', async ({ page }) => {
+  const state = await setup(page);
+  state.info = { ...empty(), configured: true, id, grants: [{ serverId: 1, scopes: ['read'] }] };
+  await page.goto('/?lang=en-US'); await openPanel(page);
+  const dialog = page.locator('#mcp-dialog');
+  const confirm = page.locator('dialog.app-dialog');
+  const rotate = dialog.getByRole('button', { name: 'Rotate MCP key', exact: true });
+  const save = page.locator('#mcp-save-config');
+  await expect(save).toBeDisabled();
+  await revealMcpGrant(page, 1);
+  const write = page.locator('input[data-server-id="1"][value="write"]');
+  await write.check();
+  await expect(save).toBeEnabled();
+  await rotate.click();
+  await expect(confirm).toContainText('The old key will stop working immediately');
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  expect(state.rotations).toEqual([]);
+  await rotate.click();
+  await confirm.getByRole('button', { name: 'Rotate MCP key' }).click();
+  await expect(dialog.getByRole('status')).toContainText('MCP key rotated');
+  expect(state.rotations).toEqual([{ expectedId: id }]);
+  expect(state.writes).toEqual([]);
+  expect(state.exports).toBe(0);
+  expect(await mcpCopies(page)).toEqual([]);
+  await expect(write).toBeChecked();
+  await expect(save).toBeEnabled();
+  await write.uncheck();
+  await expect(save).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Copy MCP configuration' }).click();
+  await expect.poll(async () => (await mcpCopies(page)).length).toBe(1);
+  const [config] = await mcpCopies(page);
+  expect(JSON.parse(config).mcpServers.cloudssh.headers.Authorization).toBe(`Bearer ${newToken}`);
+  await expect(dialog).not.toContainText(newToken);
+});
+
+for (const outcome of ['conflict', 'response lost']) {
+  test(`rotation reconciles the metadata once without a second write (${outcome})`, async ({ page }) => {
+    const state = await setup(page);
+    state.info = { ...empty(), configured: true, id };
+    await page.route('**/api/mcp/config/rotate', route => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      state.rotations.push(route.request().postDataJSON());
+      state.info.id = newId;
+      return outcome === 'conflict'
+        ? route.fulfill({ status: 409, json: { error: 'mcp_config_changed' } })
+        : route.abort('failed');
+    });
+    await page.goto('/?lang=en-US'); await openPanel(page);
+    await page.locator('#mcp-rotate-key').click();
+    await page.locator('dialog.app-dialog').getByRole('button', { name: 'Rotate MCP key' }).click();
+    await expect(page.locator('#mcp-dialog [role="status"]')).toContainText('The MCP key has changed');
+    expect(state.configReads).toBe(2);
+    expect(state.rotations).toEqual([{ expectedId: id }]);
+    expect(state.exports).toBe(0);
+  });
+}
 
 test('saved grants stay disabled until changed; reverting, exports and failed saves preserve the baseline', async ({ page }) => {
   const state = await setup(page); state.info = { ...empty(), configured: true, id, grants: [{ serverId: 1, scopes: ['read'] }] };
@@ -252,6 +323,7 @@ test('confirmed server removal updates other open and loading MCP views without 
   await expect(save).toHaveText('Save changes (2)');
   await page.locator('#mcp-activity-section > summary').click();
   await expect(page.locator('#mcp-activity-list')).toContainText('Personal server 1');
+  await page.locator('#mcp-activity-server').selectOption('1');
 
   const owner = await context.newPage(); await setup(owner, inventory);
   let badResponse = true;
@@ -275,6 +347,7 @@ test('confirmed server removal updates other open and loading MCP views without 
   await expect(owner.locator('#card-1')).toHaveCount(0);
   await expect(page.locator('#mcp-permissions [data-grant-id="1"]')).toHaveCount(0);
   await expect(page.locator('#mcp-activity-list')).not.toContainText('Personal server 1');
+  await expect(page.locator('#mcp-activity-server')).toHaveValue('');
   await expect(write).toBeChecked(); await expect(save).toHaveText('Save changes (1)');
   await save.click(); await expect(save).toBeDisabled();
   expect(state.writes).toEqual([{ grants: [{ serverId: 3, scopes: ['read', 'write'] }] }]);
@@ -321,10 +394,42 @@ test('closing a pending export cancels the request and never restores plaintext 
   await page.locator('#mcp-copy-config').click(); await expect.poll(() => started).toBe(true);
   await page.locator('#mcp-dialog').getByRole('button', { name: 'Close', exact: true }).click();
   release(); await openPanel(page);
-  await expect(page.locator('#mcp-client-config')).toHaveCount(0);
-  expect(await page.evaluate(() => (window as any).__mcpCopies)).toEqual([]);
+  expect(await mcpCopies(page)).toEqual([]);
   expect(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage]))).not.toContain(token);
 });
+
+for (const [locale, label] of [['zh-CN', '服务器'], ['zh-TW', '伺服器'], ['en-US', 'Server']]) {
+  test(`activity filter keeps the full label and wraps controls without overflow (${locale})`, async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 680 });
+    await setup(page, servers.map(server => ({ ...server, name: `Unusually long server name ${server.id} `.repeat(3) })));
+    await page.goto(`/?lang=${locale}`); await openPanel(page);
+    await page.evaluate(() => { document.documentElement.style.fontSize = '24px'; });
+    const section = page.locator('#mcp-activity-section');
+    await section.locator(':scope > summary').click();
+    const select = section.getByRole('combobox', { name: label, exact: true });
+    await expect(select).toBeVisible();
+    const layout = await section.locator('.mcp-activity-toolbar').evaluate(toolbar => {
+      const scope = toolbar.querySelector('label')!;
+      const caption = scope.querySelector('span')!;
+      const range = document.createRange();
+      range.selectNodeContents(caption);
+      const text = range.getBoundingClientRect();
+      const captionBox = caption.getBoundingClientRect();
+      const bounds = toolbar.getBoundingClientRect();
+      const select = scope.querySelector('select')!.getBoundingClientRect();
+      return {
+        lines: range.getClientRects().length,
+        complete: text.right <= captionBox.right + 1 && text.right < select.left,
+        selectFits: select.right <= bounds.right + 1 && select.height >= 44,
+        overflow: toolbar.scrollWidth > toolbar.clientWidth + 1,
+        wrapped: [...toolbar.querySelectorAll('button')].some(button => button.offsetTop > scope.offsetTop + 8),
+      };
+    });
+    expect(layout).toEqual({ lines: 1, complete: true, selectFits: true, overflow: false, wrapped: true });
+    await select.selectOption('3');
+    await expect(select).toHaveValue('3');
+  });
+}
 
 test('expanded activity shows two compact log lines without nested disclosures; collapsing stops reads', async ({ page }) => {
   const state = await setup(page); await page.goto('/?lang=zh-CN');
@@ -333,8 +438,8 @@ test('expanded activity shows two compact log lines without nested disclosures; 
     if (route.request().method() !== 'GET') return route.fallback();
     state.activityReads++;
     return route.fulfill({ json: [
-      { id: 'op-b', client: 'MCP', serverId: 3, tool: 'ssh_exec', status: 'success', startedAt: started, finishedAt: started + 1000 },
-      { id: 'op-a', client: 'MCP', serverId: 1, tool: 'ssh_exec', status: 'success', startedAt: started - 6000, finishedAt: started - 3000 },
+      { id: 'op-b', client: 'MCP', serverId: 3, tool: 'ssh_exec', status: 'unknown', failureReason: 'exec_transport_closed', startedAt: started, finishedAt: started + 1000 },
+      { id: 'op-a', client: 'MCP', serverId: 1, tool: 'ssh_exec', status: 'error', failureReason: 'private upstream diagnostic', startedAt: started - 6000, finishedAt: started - 3000 },
     ] });
   });
   await openPanel(page);
@@ -343,8 +448,9 @@ test('expanded activity shows two compact log lines without nested disclosures; 
   await section.locator(':scope > summary').click();
   const rows = section.getByRole('listitem');
   await expect(rows).toHaveCount(2);
-  await expect(rows.nth(0)).toHaveText(/2026\/11\/16 17:03:13 — 17:03:14\s+Personal server 3 · 已完成\s+ssh_exec/);
-  await expect(rows.nth(1)).toHaveText(/2026\/11\/16 17:03:07 — 17:03:10\s+Personal server 1 · 已完成\s+ssh_exec/);
+  await expect(section.getByRole('heading', { name: '2026/11/16' })).toHaveCount(1);
+  await expect(rows.nth(0)).toHaveText(/^17:03:13 · Personal server 3 · SSH 执行 · 结果未知 · SSH 连接关闭 · 1\s*秒$/);
+  await expect(rows.nth(1)).toHaveText(/^17:03:07 · Personal server 1 · SSH 执行 · 未执行 · 3\s*秒$/);
   await expect(section.locator('#mcp-activity-list details, #mcp-activity-list summary')).toHaveCount(0);
   expect(await rows.first().evaluate(node => parseFloat(getComputedStyle(node).fontSize))).toBeLessThan(13);
   expect(await rows.first().evaluate(node => node.getBoundingClientRect().height)).toBeLessThan(28);
@@ -354,13 +460,67 @@ test('expanded activity shows two compact log lines without nested disclosures; 
   await page.clock.install(); await page.clock.runFor(6000); expect(state.activityReads).toBe(count);
 });
 
+test('MCP activity merges adjacent successes and keeps writes, exceptions and raw records accessible', async ({ page }) => {
+  await setup(page);
+  const base = await page.evaluate(() => new Date(2026, 10, 25, 16, 49, 0).getTime());
+  const log = (id: string, offset: number, duration: number, extra: Partial<McpActivity> = {}): McpActivity => ({
+    id, serverId: 1, client: 'MCP', tool: 'ssh_exec', status: 'success',
+    startedAt: base + offset, finishedAt: base + offset + duration, ...extra,
+  });
+  const items = [
+    log('latest', 42_123, 233), log('second', 40_000, 1700),
+    log('write-a', 38_000, 500, { tool: 'sftp_write' }), log('write-b', 37_000, 1000, { tool: 'sftp_write' }),
+    log('unknown', 36_000, 8000, { status: 'unknown', failureReason: 'exec_timeout' }),
+    log('nonzero', 35_000, 500, { status: 'failed' }), log('old-error', 34_000, 250, { status: 'error' }),
+    log('other-server', 33_000, 500, { serverId: 3, tool: 'sftp_list' }),
+  ];
+  await page.route('**/api/mcp/activity', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: items }) : route.fallback());
+  await page.goto('/?lang=zh-CN');
+  await openPanel(page);
+  await page.locator('#mcp-activity-section > summary').click();
+  const list = page.locator('#mcp-activity-list');
+  const rows = list.getByRole('listitem');
+  const raw = page.getByRole('button', { name: '查看逐条记录' });
+  const onlyAnomalies = page.locator('#mcp-activity-anomalies');
+  const filter = page.getByRole('combobox', { name: '服务器', exact: true });
+  await expect(rows).toHaveCount(7);
+  await expect(rows.first()).toHaveText(/16:49:40 – 16:49:42 · Personal server 1 · SSH 执行 ×2 · 最慢 1\.7\s*秒/);
+  await expect(rows.filter({ hasText: 'SFTP 写入' })).toHaveCount(2);
+  await expect(rows.filter({ hasText: '命令执行超时' })).toHaveCount(1);
+  await expect(onlyAnomalies).toHaveText('只看异常（3）');
+  await filter.selectOption('1');
+  await expect(list.getByRole('heading', { name: '2026/11/25 · Personal server 1' })).toBeVisible();
+  await expect(rows.first()).not.toContainText('Personal server 1');
+  await expect(rows).toHaveCount(6);
+  await raw.click();
+  await expect(raw).toHaveAttribute('aria-pressed', 'true');
+  await expect(rows).toHaveCount(7);
+  await expect(rows.first()).toHaveText(/16:49:42\.123 – 16:49:42\.356 · ssh_exec · 已完成/);
+  await onlyAnomalies.click();
+  await expect(onlyAnomalies).toHaveAttribute('aria-pressed', 'true');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(1)).toContainText('非零退出');
+  await expect(rows.nth(2)).toContainText('未执行');
+  await filter.selectOption('3');
+  await expect(onlyAnomalies).toHaveText('只看异常（0）');
+  await expect(list).toHaveText('近期操作没有异常。');
+  await onlyAnomalies.click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('sftp_list');
+});
+
 test('activity log exposes all 100 bounded records in a scrollable area', async ({ page }) => {
   await setup(page);
+  const now = await page.evaluate(() => new Date(2026, 10, 25, 12).getTime());
   await page.route('**/api/mcp/activity', route => route.request().method() === 'GET' ? route.fulfill({ json:
     Array.from({ length: 100 }, (_, index) => ({ id: `log-${index}`, client: 'MCP', serverId: 1, tool: 'ssh_exec',
-      status: 'success', startedAt: Date.now() - index * 2000, finishedAt: Date.now() - index * 2000 + 1000 })) }) : route.fallback());
+      status: 'success', startedAt: now - index * 2000, finishedAt: now - index * 2000 + 1000 })) }) : route.fallback());
   await page.goto('/?lang=en-US'); await openPanel(page);
   await page.locator('#mcp-activity-section > summary').click();
+  await expect(page.locator('#mcp-activity-list').getByRole('listitem')).toHaveCount(1);
+  await expect(page.locator('#mcp-activity-list').getByRole('listitem')).toContainText('×100');
+  await page.locator('#mcp-activity-raw').click();
   await expect(page.locator('#mcp-activity-list').getByRole('listitem')).toHaveCount(100);
   expect(await page.locator('#mcp-activity-list').evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
 });

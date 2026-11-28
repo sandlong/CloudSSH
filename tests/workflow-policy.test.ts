@@ -26,7 +26,7 @@ describe('Fork 工作流执行策略', () => {
     const deploy = readWorkflow('deploy.yml');
     for (const job of [readDeployJob('validate-test'), readDeployJob('deploy-production')]) {
       expect(job.match(/run: pnpm run build:frontend/g)).toHaveLength(1);
-      expect(job.match(/run: pnpm exec wrangler deploy(?: --env test)?$/gm)).toHaveLength(1);
+      expect(job.match(/run: pnpm exec wrangler deploy(?: --env test src\/worker\/rdp-preview-entry\.ts)?$/gm)).toHaveLength(1);
       const build = job.indexOf('run: pnpm run build:frontend');
       const deployStep = job.indexOf('      - name: Deploy verified artifact');
       expect(build).toBeLessThan(deployStep);
@@ -84,6 +84,26 @@ describe('CI 验证和部署边界', () => {
     expect(production).toMatch(/^    if: github\.repository_owner == 'newbietan' && github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'$/m);
     expect(production).toContain('pnpm install --frozen-lockfile');
     expect(production).not.toMatch(/playwright|pnpm test|typecheck|test:e2e|always\(\)/i);
+  });
+
+  it('aligns test only after a proven main push deploy with an isolated repository token', () => {
+    const deploy = readWorkflow('deploy.yml');
+    const sync = readDeployJob('sync-released-test');
+    const verify = readDeployJob('verify-production');
+    expect(verify).toContain('tested_sha: ${{ steps.proof.outputs.tested_sha }}');
+    expect(verify).toContain('id: proof');
+    expect(readFileSync(new URL('../scripts/ci-verify-tested-release.mjs', import.meta.url), 'utf8'))
+      .toContain('`tested_sha=${result.testCommit}\\n`');
+    expect(sync).toContain('needs: [verify-production, deploy-production]');
+    expect(sync).toContain("github.repository == 'newbietan/CloudSSH' &&");
+    expect(sync).toContain("github.event_name == 'push' && github.ref == 'refs/heads/main'");
+    expect(sync).toContain('contents: write\n      pull-requests: read');
+    expect(deploy.match(/contents: write/g)).toHaveLength(1);
+    expect(sync).toContain('ref: ${{ github.sha }}\n          persist-credentials: false');
+    expect(sync).toContain('GH_TOKEN: ${{ github.token }}');
+    expect(sync).toContain('TESTED_SHA: ${{ needs.verify-production.outputs.tested_sha }}');
+    expect(sync).toContain('run: node scripts/ci-sync-released-test.mjs');
+    expect(sync).not.toMatch(/secrets\.|pull_request_target|always\(\)|continue-on-error|wrangler|pnpm/);
   });
 
   it('retires the RDP preview and keeps the standard deployment free of compiler steps', () => {

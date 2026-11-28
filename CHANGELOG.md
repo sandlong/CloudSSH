@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.1] - 2026-11-27
+
+### Added
+
+- **MCP 个人密钥轮换**：已配置的账户可在「外部 AI 助手 MCP 设置」中手动轮换。旧密钥立即失效，没有宽限期；服务器权限、Cloudflare Access Service Token 和操作记录不变。轮换后请重新复制配置并更新所有客户端。无须数据库迁移，详见 [MCP 指南](docs/mcp.md)。
+
+### Changed
+
+- **MCP 配置导出**：移除「查看配置」和明文预览，仅在用户明确点击「复制 MCP 配置」时读取凭据。
+- **设置保存状态**：编辑已有设置时，未修改或改回原值都会禁用保存按钮，不发送重复保存请求；新建流程不变。
+- **分享弹窗**：精简链接是临时访问凭证的提示，保留创建前的主机指纹校验。
+
+### Fixed
+
+- **MCP 操作日志筛选栏**：窄屏或放大字号时，「服务器」标签保持完整单行，空间不足时筛选控件换行。
+
+## [2.13.0] - 2026-11-26
+
+### Added
+
+- **Windows WebRTC 直连**：浏览器优先通过目标 Windows 上的连接器访问桌面，Worker 负责授权和信令，不转发直连桌面流量。「连接器」模式无需公网地址或入站 RDP 端口，没有备用中继；已有公网直连和 Cloudflare Tunnel 配置也可启用 WebRTC，不需要迁移。关联 Issue：[#201](https://github.com/newbietan/CloudSSH/issues/201)。
+- **站内下载与自动绑定**：从「WebRTC直连配置」下载设备专用 Windows x64 ZIP，完整解压后运行安装器，服务上线即自动绑定。无需配对码、网页再次确认或配置额外 Worker Secret；正式站提供官方发布的 Windows x64 安装包，Windows 登录密码不进入安装包。详见 [Windows 连接器指南](docs/rdp-peer.md)。
+
+### Changed
+
+- **桌面选路与延迟显示**：「打开桌面」优先 WebRTC；只有在发送 RDP 字节前直连建立失败，才静默切回该设备已配置的公网或隧道中继，不重复发起 Windows 登录。工具栏优先显示 WebRTC 线路 RTT，无近期数据时标明「通道」；中继单独标识。点击可查看通道近期峰值、浏览器待读取峰值和 Windows 上报的 RDP 平均延迟，不拿排队尖峰冒充线路 RTT。
+- **站内弹窗风格统一**：添加服务器、AI 配置、MCP、Windows 引导、认证和编辑等复用同一套主题面板、标题栏与遮罩；保留各主题材质及移动 Liquid Glass 的实底。安装引导只显示当前步骤，时效和校验说明收在「安装须知」，测试包的未签名警示仍直接可见。
+
+### Fixed
+
+- **WebRTC 直连预检**：浏览器和 Windows 连接器支持 Cloudflare STUN 的备用 UDP 53 端口；对等访问受限时仍按配置静默回退。预检失败时可从本地 Console 核对阶段、用时与 ICE 状态，不记录地址、票据或凭据。
+- **WebRTC 交互排队**：Windows 连接器按当前 SCTP 拥塞窗口限制读入发送队列的数据，浏览器更早确认直连已读取的字节。减少弱网下画面突发积压，不改可靠传输、1 MiB 上限、分辨率或中继策略。
+
+### Security
+
+- **Windows 连接凭据**：`connect` 只返回与当前连接和浏览器临时密钥绑定的加密登录封装，不再在响应正文中返回明文用户名、域或密码。选定线路后才在浏览器内存解密供 FreeRDP 使用；旧页面需刷新，既有会话信任和续租协议不变。
+
+## [2.12.6] - 2026-11-25
+
+### Added
+
+- **Windows 远程桌面全屏分辨率**：默认仍为「仅缩放」。支持动态分辨率的 Windows 可在全屏工具栏选「适配全屏」、720p 或 1080p，向远端请求调整实际分辨率；退出全屏后恢复窗口尺寸同步。中继选址策略不变。关联 Issue：[#213](https://github.com/newbietan/CloudSSH/issues/213)。
+
+### Fixed
+
+- **Windows 首次证书确认与连接诊断**：确认期间上游提前断开时，在租约有效且等待未超时的前提下保留弹窗；成功保存信任、且中继确认上游已断开后，才用新票据重连一次，并复核设备修订和证书指纹。分别提示 Windows 登录被拒绝、安全协商失败、首帧前断开及确认超时。关联 Issue：[#216](https://github.com/newbietan/CloudSSH/issues/216)。
+- **MCP 命令执行结果**：区分已知退出码、明确未执行和执行结果未知；为通道拒绝、超时、连接中断及缺少退出状态提供对应诊断，不自动重试结果未知的命令。
+
+### Changed
+
+- **MCP 操作日志**：按本地日期分组，合并相邻的成功执行、读取和列目录，显示次数和最长单次耗时。写入和异常逐条展示，可按服务器、异常状态筛选或展开逐条记录；仍不保存命令、路径和输出。
+
+## [2.12.5] - 2026-11-25
+
+### Added
+
+- **Windows 远程桌面双栈直连**：支持公网 IPv6、域名和 DDNS，以及既有公网 IPv4。域名在每次连接时校验 A/AAAA，双栈可在 TCP 未建立时换地址。DDNS 改址不影响既有登录配置，仍严格核对 Windows 证书；内网设备继续使用 Cloudflare Tunnel。关联 Issue：[#208](https://github.com/newbietan/CloudSSH/issues/208)。
+
+### Fixed
+
+- **SSH 保活兼容性**：修复 MikroTik RouterOS 已回复保活请求却被误判为超时并重连的问题。仅将与本次探针序号匹配的“不支持”回复视为在线，保留真正无响应时的断线保护。关联 Issue：[#211](https://github.com/newbietan/CloudSSH/issues/211)。
+- **发布核验**：测试运行成功但 GitHub Actions 的步骤详情尚未同步时，会限时重查同一次运行。明确失败、取消、跳过或最终缺少验证证据，仍会阻止发布。
+
+### Changed
+
+- **发布后分支同步**：生产部署成功后自动将仍停留在发布候选的 `test` 对齐到 `main`，不再因这次同步重复触发 GitHub Actions 构建。发布期间新增的 `test` 提交会保留；正常开发推送仍完整验证。
+
 ## [2.12.4] - 2026-11-24
 
 ### Added

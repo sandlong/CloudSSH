@@ -1,13 +1,23 @@
 import { normalizeServerTags } from './server-tags';
 import { isRestrictedTcpPort } from './tcp-port-policy';
 
-export type RdpRoute = 'direct' | 'tunnel';
+export type RdpRoute = 'direct' | 'tunnel' | 'connector';
+export const RDP_CONNECTOR_FILENAME = 'cloudssh-rdp-connector-windows-amd64.zip';
+export const RDP_CONNECTOR_DOWNLOAD = `https://github.com/newbietan/CloudSSH/releases/download/rdp-connector-v3/${RDP_CONNECTOR_FILENAME}`;
+export const RDP_CONNECTOR_MAX_DOWNLOAD = 16 * 1024 * 1024;
+export const RDP_CONNECTOR_BINDING_FILENAME = 'cloudssh-binding.cloudssh-rdp.json';
+export const rdpConnectorSetupFilename = (profile: string) => `cloudssh-windows-setup-${profile.slice(0, 8)}.zip`;
+export type RdpConnector = { state: 'unbound' } | { state: 'waiting'; expires: number }
+  | { state: 'online' | 'offline'; label: string; fingerprint: string } | { state: 'other_origin'; origin: string };
 export const RDP_MAX_PROFILES = 32;
 export const RDP_MAX_BODY = 12 * 1024;
 export const RDP_WINDOW = 1024 * 1024;
 export const RDP_FRAME = 16 * 1024;
 export const RDP_WS_PROTOCOL = 'cloudssh-rdp-v1';
 export const RDP_CLIENT_REVISION = 5;
+// Only credential-bearing connect changed. Existing trust and renewal requests keep their ABI.
+export const RDP_CONNECT_REVISION = 6;
+export const RDP_CONNECT_KEY_HEADER = 'X-CloudSSH-RDP-Client-Key';
 export const RDP_DEFAULT_PORT = 3389;
 
 export function isRdpPort(value: unknown): value is number {
@@ -40,6 +50,7 @@ export interface RdpProfile extends Omit<RdpProfileInput, 'accessId' | 'accessSe
   hasAccessToken: boolean;
   hasLogin: boolean;
   tags: string[];
+  connector?: RdpConnector;
 }
 
 /** Authenticated card projection. No domain, password, token or encrypted login blob. */
@@ -50,7 +61,6 @@ export interface RdpCard extends RdpProfile {
   updated_at: number | null;
 }
 
-/** Direct endpoints intentionally accept public IPv4 literals only in the first version. */
 export function isPublicRdpIPv4(value: string): boolean {
   const components = value.split('.');
   if (components.length !== 4 || components.some((part) => !/^(0|[1-9]\d{0,2})$/.test(part))) return false;
@@ -61,6 +71,48 @@ export function isPublicRdpIPv4(value: string): boolean {
     !(a === 192 && (b === 168 || (b === 0 && (c === 0 || c === 2)) || (b === 88 && c === 99))) &&
     !(a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) &&
     !(a === 203 && b === 0 && c === 113);
+}
+
+/** Return the unbracketed, canonical literal. Do not admit scoped or mapped addresses. */
+export function normalizePublicRdpIPv6(value: string): string | null {
+  const bare = value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1) : value;
+  if (!bare.includes(':') || !/^[\da-f:.]{2,45}$/i.test(bare)) return null;
+  try {
+    const ip = new URL(`http://[${bare}]/`).hostname.slice(1, -1);
+    const [a, b = ''] = ip.split(':', 2);
+    const first = Number.parseInt(a, 16);
+    const second = b ? Number.parseInt(b, 16) : 0;
+    // Global unicast only. Exclude protocol/special-use, transition and documentation space.
+    if (first < 0x2000 || first > 0x3fff || !Number.isFinite(first) ||
+        (first === 0x2001 && (second <= 0x1ff || second === 0xdb8)) ||
+        first === 0x2002 || first === 0x3ffe || (first === 0x3fff && second <= 0xfff)) return null;
+    return ip;
+  } catch { return null; }
+}
+
+export type RdpDirectHost = { kind: 'ipv4' | 'ipv6' | 'domain'; host: string };
+
+/** Classify a saved endpoint, not its reachability. Domains must be resolved at dial time. */
+export function parseRdpDirectHost(input: string): RdpDirectHost | null {
+  const value = input.trim();
+  if (value.length > 254) return null;
+  if (isPublicRdpIPv4(value)) return { kind: 'ipv4', host: value };
+  if (value.includes(':')) {
+    const ip = normalizePublicRdpIPv6(value);
+    return ip ? { kind: 'ipv6', host: ip } : null;
+  }
+  // The URL parser provides IDNA canonicalization, not URL input or alternate IPv4 spellings.
+  if (!value || /[\s\x00-\x1f\x7f/\\?#@%\[\]]/u.test(value)) return null;
+  try {
+    const host = new URL(`http://${value}/`).hostname.replace(/\.$/, '');
+    const labels = host.split('.');
+    const tld = labels.at(-1) ?? '';
+    if (host.length > 253 || labels.length < 2 || !/[a-z]/.test(tld) ||
+        !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ||
+        ['localhost', 'local', 'internal', 'test', 'invalid', 'example', 'onion'].includes(tld) ||
+        host === 'home.arpa' || host.endsWith('.home.arpa')) return null;
+    return { kind: 'domain', host };
+  } catch { return null; }
 }
 
 export function isRdpTunnelHost(value: string): boolean {
@@ -82,10 +134,15 @@ export function parseRdpProfile(value: unknown): RdpProfileInput | null {
   if (data.login !== undefined && !isRdpLogin(data.login)) return null;
   const extra = { ...(data.tags === undefined ? {} : { tags: normalizeServerTags(data.tags) }),
     ...(data.login === undefined ? {} : { login: data.login }) };
+  if (route === 'connector') {
+    if (host !== '' || data.port !== undefined || data.accessId !== undefined || data.accessSecret !== undefined) return null;
+    return { name, host: '', route, ...extra };
+  }
   if (route === 'direct') {
-    if (!isPublicRdpIPv4(host) || data.accessId !== undefined || data.accessSecret !== undefined) return null;
+    const direct = parseRdpDirectHost(data.host);
+    if (!direct || data.accessId !== undefined || data.accessSecret !== undefined) return null;
     if (data.port !== undefined && !isRdpPort(data.port)) return null;
-    return { name, host, route, ...(data.port === undefined ? {} : { port: data.port }), ...extra };
+    return { name, host: direct.host, route, ...(data.port === undefined ? {} : { port: data.port }), ...extra };
   }
   if (route !== 'tunnel' || data.port !== undefined || !isRdpTunnelHost(host)) return null;
   const accessId = data.accessId;
@@ -97,14 +154,17 @@ export function parseRdpProfile(value: unknown): RdpProfileInput | null {
   return { name, host, route, accessId, accessSecret, ...extra };
 }
 
-export async function readRdpJson(request: Pick<Request | Response, 'body' | 'headers'>): Promise<unknown> {
+export async function readRdpJson(request: Pick<Request | Response, 'body' | 'headers'>, signal?: AbortSignal): Promise<unknown> {
   const length = request.headers.get('Content-Length');
   if (!request.body || (length !== null && (!/^\d+$/.test(length) || Number(length) > RDP_MAX_BODY))) return null;
   const reader = request.body.getReader();
   const bytes = new Uint8Array(RDP_MAX_BODY);
   let offset = 0;
   let expired = false;
-  const timer = setTimeout(() => { expired = true; void reader.cancel().catch(() => {}); }, 5000);
+  const cancel = () => { expired = true; void reader.cancel().catch(() => {}); };
+  const timer = setTimeout(cancel, 5000);
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -118,6 +178,7 @@ export async function readRdpJson(request: Pick<Request | Response, 'body' | 'he
     return null;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
     void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
